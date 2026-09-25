@@ -300,11 +300,14 @@ def process_analyze(
         "error": record.error,
     }
     if record.error is None:
-        solved = solve_reaction(reactant_texts, product_texts)
-        balanced_view = build_balanced_view(solved)
+        # 命中缓存时直接复用缓存里的系数构建配平视图，不再重新求解；
+        # 未命中时记录刚由 solve_reaction 写出，用同一份结果构建视图。
+        balanced_view = build_balanced_view(
+            _solved_from_parts(reactants, products, record.coefficients)
+        )
         payload["balanced"] = _view(
-            list(solved.reactants),
-            list(solved.products),
+            reactants,
+            products,
             balanced_view,
             coefficient_map=record.coefficients,
             assumed=None,

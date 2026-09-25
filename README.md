@@ -55,8 +55,12 @@
     全部百分比容差（闭区间）与质量区间的整数计数，按总百分比绝对偏差、
     摩尔质量、C/H/N/O 计数依次升序返回前 20 个分子式（含各项计算百分比、
     匹配总数与截断标志），无解返回空列表；
-15. 对同一规范化反应做幂等缓存：记录持久化到 SQLite（容器重启可恢复），
-    重复请求返回相同的 `reaction_id` 与结果，按最近访问 LRU 保留 10000 条。
+15. 对同一规范化反应做幂等缓存：签名只取每侧物种的组成键（元素组成 +
+    电荷）多重集并保留反应物 / 生成物侧别，与书写顺序、括号风格、空白及
+    元素排列顺序（`H2O` / `OH2`）无关；命中后按本次输入回显化学式并复用
+    缓存的配平结果。记录持久化到 SQLite（容器重启可恢复），重复请求返回
+    相同的 `reaction_id`，按最近访问 LRU 保留 10000 条，旧 `reaction_id`
+    仍可通过 GET 查询。
 
 ---
 
@@ -290,7 +294,7 @@ pytest          # 全部测试（解析器/配平/计量/库存/溶液/同位素
 
 ```json
 {
-  "reaction_id": "rxn_7ed134d0c6ec5699",
+  "reaction_id": "rxn_10a2643fd764fdb7",
   "cached": false,
   "normalized": {
     "reactants": ["HCl", "KMnO4"],
@@ -371,7 +375,7 @@ curl -X POST http://localhost:8000/api/v1/balance/variants \
 
 ```json
 {
-  "reaction_id": "rxn_aa766b24597bded4",
+  "reaction_id": "rxn_aa23e4391005e690",
   "normalized": {
     "reactants": ["C", "O2"],
     "products": ["CO", "CO2"],
@@ -719,7 +723,7 @@ curl -X POST http://localhost:8000/api/v1/stoichiometry/sequence \
   "steps": [
     {
       "index": 0,
-      "reaction_id": "rxn_a584b7435c0643ca",
+      "reaction_id": "rxn_5c30972e949ee769",
       "cached": false,
       "normalized": {
         "reactants": ["FeS2", "O2"],
@@ -1416,17 +1420,29 @@ O 53.3̅%，均落入容差），`200` 响应：
 
 ### 2.14 幂等与查询
 
-* 幂等键与书写顺序、括号风格、空白以及电荷的等价写法无关，只取决于每一侧
-  物种的 **（元素组成多重集, 电荷）**。
+* 幂等键与书写顺序、括号风格、空白、电荷的等价写法以及**元素排列顺序**无关：
+  每个物种只按其 **（元素组成, 电荷）** 取规范键，`H2O` 与 `OH2`、
+  `SO4^2-` 与 `[SO4]2-` 都视为同一物种；签名只统计每一侧物种规范键的
+  **多重集**（同一物种出现几次计几次），并保留反应物 / 生成物的**侧别**。
+  规范化文本本身不参与签名，因此命中记录后响应仍按**本次请求**的写法
+  回显化学式（系数/配平结果复用缓存）。
 * 因此下面两个请求得到 **同一个 `reaction_id`**，第二次 `cached=true`：
 
 ```bash
-curl -X POST .../api/v1/balance -d '{"reactants":["Ca(OH)2","HCl"],"products":["CaCl2","H2O"]}'
-curl -X POST .../api/v1/balance -d '{"reactants":["Ca [OH]2"," HCl"],"products":["CaCl2","H2 O"]}'
+curl -X POST .../api/v1/balance -d '{"reactants":["H2","O2"],"products":["H2O"]}'
+curl -X POST .../api/v1/balance -d '{"reactants":["H2","O2"],"products":["OH2"]}'
 ```
+
+  第二次响应中的配平结果（系数向量、守恒结论）来自缓存，而 `normalized`
+  与各物种条目的 `input` / `normalized` 按本次输入展示为 `2H2 + O2 -> 2OH2`。
+  `/analyze` 使用完全相同的签名与命中语义。仅调换反应物与生成物两侧会
+  得到**不同**的 `reaction_id`（侧别是签名的一部分）。
 
 * 用 `GET /api/v1/reactions/{reaction_id}` 可随时取回缓存结果（SQLite
   持久缓存，LRU 保留最近 10000 条；容器重启后仍可恢复，见第 1 节缓存卷说明）。
+  签名算法升级前已写入缓存的**旧 `reaction_id` 仍可用于 `GET` 查询**：
+  查询按 ID 主键直接取回该记录；等价写法再次提交时则按当前签名写入 /
+  命中新记录，新旧两条记录互不影响。
 * 每次取回（`GET` 命中或重复提交同一签名）都会刷新该记录的最近访问时间；
   超过 10000 条时，**最久未被访问**的记录被淘汰。写入、访问时间更新与淘汰
   在同一数据库事务内提交，并发请求或进程中断都不会留下半条记录。

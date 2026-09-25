@@ -5,6 +5,7 @@
 应在启动时明确报错）。
 """
 
+import json
 import sqlite3
 
 import pytest
@@ -38,6 +39,37 @@ def _make_record(cache: ReactionCache, tag: str, *, error=None):
         [tag],
         error,
     ), sig
+
+
+# ------------------------------------------------------------ 签名与写法无关
+def test_signature_ignores_normalized_spelling_and_order():
+    """组成键 + 电荷相同即同签名：元素排列（H2O/OH2）、括号、书写顺序均无关。"""
+    r = [_species("H2"), _species("O2")]
+    sig = build_signature(r, [_species("H2O")])
+    # 元素排列顺序不同但组成相同
+    assert sig == build_signature(r, [_species("OH2")])
+    # 括号风格 / 空白等价写法
+    assert sig == build_signature(
+        [_species("H2"), _species("O2")], [_species("(H2O)")]
+    )
+    # 物种书写顺序不同
+    assert sig == build_signature([_species("O2"), _species("H2")], [_species("H2O")])
+    # 规范化文本没有混入签名
+    assert "H2O" not in sig and "OH2" not in sig
+
+
+def test_signature_preserves_side_charge_and_multiplicity():
+    h2o = _species("H2O")
+    h2 = _species("H2")
+    o2 = _species("O2")
+    # 调换反应物 / 生成物侧别 -> 不同签名
+    assert build_signature([h2, o2], [h2o]) != build_signature([h2o], [h2, o2])
+    # 同一规范键出现次数（重数）不同 -> 不同签名
+    assert build_signature([], [h2o]) != build_signature([], [h2o, h2o])
+    # 电荷不同（组成相同）-> 不同签名
+    assert build_signature([], [_species("Fe")]) != build_signature(
+        [], [_species("Fe3+")]
+    )
 
 
 # ------------------------------------------------------------ 基本读写
@@ -253,4 +285,137 @@ def test_service_balance_record_recovers_after_reopen(tmp_path, monkeypatch):
     assert got_err.json()["error"]["code"] == "FORMULA_PARSE_ERROR"
     assert got_err.json()["reaction_id"] == err_rid
     reopened.close()
+
+
+def _legacy_signature(reactants, products) -> str:
+    """签名算法升级前（混入规范化文本）的旧签名构造，用于造旧记录。"""
+    def key(sp):
+        comp = ",".join(f"{el}:{n}" for el, n in sp.formula.key[0])
+        return f"[{comp}]{sp.formula.charge:+d}"
+
+    return json.dumps(
+        {
+            "r": sorted((key(sp), sp.normalized) for sp in reactants),
+            "p": sorted((key(sp), sp.normalized) for sp in products),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def test_legacy_reaction_id_still_gettable_and_new_signature_reopens(tmp_path, monkeypatch):
+    """旧 SQLite 记录的旧 reaction_id 继续支持 GET；新签名重启后仍命中。"""
+    from app import service
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    db = tmp_path / "legacy.db"
+
+    # 1) 用“旧签名”预先写入一条 H2 + O2 -> H2O 的记录（模拟升级前的库）
+    reactants = [_species("H2"), _species("O2")]
+    products = [_species("H2O")]
+    legacy_sig = _legacy_signature(reactants, products)
+    legacy_rid = reaction_id_for(legacy_sig)
+    seeded = ReactionCache(db)
+    seeded.put(
+        legacy_sig,
+        reactants,
+        products,
+        {"[H:2]+0": 2, "[O:2]+0": 1, "[H:2,O:1]+0": 2},
+        ["H", "O"],
+        None,
+    )
+    seeded.close()
+
+    reopened = ReactionCache(db)  # 模拟升级后重启
+    monkeypatch.setattr(service, "cache", reopened)
+    client = TestClient(app)
+
+    # 2) 旧 reaction_id 的 GET 查询仍然可用
+    got = client.get(f"/api/v1/reactions/{legacy_rid}")
+    assert got.status_code == 200
+    assert got.json()["reaction_id"] == legacy_rid
+    assert got.json()["coefficients"]["vector"] == [2, 1, 2]
+
+    # 3) 新签名第一次请求产生新 reaction_id（未命中旧记录）
+    first = client.post(
+        "/api/v1/balance", json={"reactants": ["H2", "O2"], "products": ["H2O"]}
+    )
+    assert first.status_code == 200
+    new_rid = first.json()["reaction_id"]
+    assert first.json()["cached"] is False
+    assert new_rid != legacy_rid
+
+    # 4) 元素排列等价写法 OH2 命中同一条新记录，回显沿用本次输入
+    equiv = client.post(
+        "/api/v1/balance", json={"reactants": ["H2", "O2"], "products": ["OH2"]}
+    )
+    assert equiv.status_code == 200
+    body = equiv.json()
+    assert body["reaction_id"] == new_rid
+    assert body["cached"] is True
+    assert body["normalized"]["products"] == ["OH2"]
+    assert body["normalized"]["equation"] == "2H2 + O2 -> 2OH2"
+    prod = body["coefficients"]["products"][0]
+    assert prod["input"] == "OH2"
+    assert prod["normalized"] == "OH2"
+    assert prod["coefficient"] == 2
+    # 配平计算结果复用缓存
+    assert body["coefficients"]["vector"] == [2, 1, 2]
+    reopened.close()
+
+    # 5) 再次“重启”：新签名记录仍在，OH2 仍命中；旧 ID 仍可 GET
+    second = ReactionCache(db)
+    monkeypatch.setattr(service, "cache", second)
+    client2 = TestClient(app)
+    after = client2.post(
+        "/api/v1/balance", json={"reactants": ["H2", "O2"], "products": ["OH2"]}
+    )
+    assert after.status_code == 200
+    assert after.json()["reaction_id"] == new_rid
+    assert after.json()["cached"] is True
+    legacy_get = client2.get(f"/api/v1/reactions/{legacy_rid}")
+    assert legacy_get.status_code == 200
+    assert legacy_get.json()["reaction_id"] == legacy_rid
+    assert len(second) == 2
+    second.close()
+
+
+def test_analyze_equivalent_writing_hits_after_reopen(tmp_path, monkeypatch):
+    """/analyze 与 /balance 共享签名；重启后等价写法命中且按本次输入展示。"""
+    from app import service
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    db = tmp_path / "analyze.db"
+    c1 = ReactionCache(db)
+    monkeypatch.setattr(service, "cache", c1)
+    client = TestClient(app)
+
+    first = client.post(
+        "/api/v1/analyze", json={"reactants": ["H2", "O2"], "products": ["H2O"]}
+    )
+    assert first.status_code == 200
+    rid = first.json()["reaction_id"]
+    assert first.json()["cached"] is False
+    c1.close()
+
+    c2 = ReactionCache(db)  # 重启
+    monkeypatch.setattr(service, "cache", c2)
+    second = client.post(
+        "/api/v1/analyze", json={"reactants": ["H2", "O2"], "products": ["OH2"]}
+    )
+    assert second.status_code == 200
+    body = second.json()
+    assert body["reaction_id"] == rid
+    assert body["cached"] is True
+    # 本次输入写法回显，缓存中的配平结果复用
+    assert body["normalized"]["products"] == ["OH2"]
+    assert body["normalized"]["equation"] == "2H2 + O2 -> 2OH2"
+    balanced_product = body["balanced"]["species"]["products"][0]
+    assert balanced_product["normalized"] == "OH2"
+    assert balanced_product["coefficient"] == 2
+    assert body["balanced_ok"] is True
+    c2.close()
 

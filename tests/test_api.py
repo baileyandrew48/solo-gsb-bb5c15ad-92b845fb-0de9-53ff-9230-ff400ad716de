@@ -57,6 +57,77 @@ def test_idempotent_order_independent():
     assert r1.json()["reaction_id"] == r2.json()["reaction_id"]
 
 
+def test_idempotent_equivalent_element_order_h2o_oh2(monkeypatch):
+    """组成与电荷相同、仅元素排列不同（H2O vs OH2）必须命中同一 reaction_id。
+
+    命中后按本次输入回显化学式，系数等计算结果复用缓存；/analyze 同理。
+    用独立内存库隔离，避免依赖其它测试的缓存状态。
+    """
+    from app import service
+    from app.cache import ReactionCache
+
+    monkeypatch.setattr(service, "cache", ReactionCache(":memory:"))
+
+    first = client.post(
+        "/api/v1/balance",
+        json={"reactants": ["H2", "O2"], "products": ["H2O"]},
+    )
+    second = client.post(
+        "/api/v1/balance",
+        json={"reactants": ["H2", "O2"], "products": ["OH2"]},
+    )
+    assert first.status_code == second.status_code == 200
+    d1, d2 = first.json(), second.json()
+    assert d1["reaction_id"] == d2["reaction_id"]
+    assert d1["cached"] is False and d2["cached"] is True
+    # 计算结果复用缓存
+    assert d1["coefficients"]["vector"] == d2["coefficients"]["vector"] == [2, 1, 2]
+    assert d2["charge_balance"]["balanced"] is True
+    # 展示按本次输入
+    assert d2["normalized"]["products"] == ["OH2"]
+    assert d2["normalized"]["equation"] == "2H2 + O2 -> 2OH2"
+    prod = d2["coefficients"]["products"][0]
+    assert prod["input"] == "OH2"
+    assert prod["normalized"] == "OH2"
+    assert prod["coefficient"] == 2
+
+    # /analyze 使用同一签名并命中
+    analyzed = client.post(
+        "/api/v1/analyze",
+        json={"reactants": ["H2", "O2"], "products": ["OH2"]},
+    )
+    assert analyzed.status_code == 200
+    a = analyzed.json()
+    assert a["reaction_id"] == d1["reaction_id"]
+    assert a["cached"] is True
+    assert a["normalized"]["products"] == ["OH2"]
+    assert a["normalized"]["equation"] == "2H2 + O2 -> 2OH2"
+    assert a["balanced"]["species"]["products"][0]["normalized"] == "OH2"
+    assert a["balanced"]["species"]["products"][0]["coefficient"] == 2
+
+    # GET 取回时以缓存记录的规范化形式展示
+    fetched = client.get(f"/api/v1/reactions/{d1['reaction_id']}")
+    assert fetched.status_code == 200
+    assert fetched.json()["normalized"]["products"] == ["H2O"]
+    assert fetched.json()["coefficients"]["vector"] == [2, 1, 2]
+
+
+def test_idempotent_side_swap_is_different_id(monkeypatch):
+    """调换反应物与生成物侧别应得到不同 reaction_id（侧别保留在签名中）。"""
+    from app import service
+    from app.cache import ReactionCache
+
+    monkeypatch.setattr(service, "cache", ReactionCache(":memory:"))
+    forward = client.post(
+        "/api/v1/balance", json={"reactants": ["H2", "O2"], "products": ["H2O"]}
+    ).json()
+    swapped = client.post(
+        "/api/v1/balance", json={"reactants": ["H2O"], "products": ["H2", "O2"]}
+    )
+    # 反向反应无法配平（这里只验证签名不同 -> 不是缓存命中的同一 ID）
+    assert swapped.json()["reaction_id"] != forward["reaction_id"]
+
+
 def test_get_reaction_by_id():
     created = client.post(
         "/api/v1/balance", json={"reactants": ["Fe", "O2"], "products": ["Fe2O3"]}

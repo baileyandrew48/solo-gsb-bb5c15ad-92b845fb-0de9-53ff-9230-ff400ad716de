@@ -1,8 +1,10 @@
 """基于规范化签名的幂等缓存（SQLite 持久化，LRU 淘汰）。
 
-缓存键与具体写法无关：只依赖每一侧“物种组成键 + 电荷”的多重集，
-因此 ``SO4^2-`` 与 ``[SO4]2-``、不同括号风格、不同的物种书写顺序
-都会命中同一条记录。条目数量有上限（默认 10000 条），按最近访问
+缓存键与具体写法无关：只依赖每一侧“物种组成键 + 电荷”的多重集
+（同一种物种出现几次就计几次），因此 ``SO4^2-`` 与 ``[SO4]2-``、
+``H2O`` 与 ``OH2``（元素排列顺序不同但组成相同）、不同括号风格、
+不同的物种书写顺序都会命中同一条记录；反应物侧与生成物侧分别计入
+签名，侧别不会被打乱。条目数量有上限（默认 10000 条），按最近访问
 （读或写）时间 LRU 淘汰。
 
 与早期纯内存实现不同，记录持久化在 SQLite 文件中，容器重启后仍可
@@ -70,9 +72,17 @@ def species_key(sp: Species) -> str:
 
 
 def build_signature(reactants: list[Species], products: list[Species]) -> str:
+    """生成与写法无关的反应签名。
+
+    只取每一侧物种规范键（元素组成 + 电荷）的多重集：同一规范键出现
+    几次就在列表中出现几次（重数保留），再排序消除书写顺序的影响；
+    反应物与生成物分属 ``r`` / ``p`` 两个键，侧别信息保留。规范化文本
+    （如 ``H2O`` 与 ``OH2``）不参与签名——它们组成与电荷相同，必须
+    命中同一条记录。
+    """
     payload = {
-        "r": sorted((species_key(sp), sp.normalized) for sp in reactants),
-        "p": sorted((species_key(sp), sp.normalized) for sp in products),
+        "r": sorted(species_key(sp) for sp in reactants),
+        "p": sorted(species_key(sp) for sp in products),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
