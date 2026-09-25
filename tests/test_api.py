@@ -57,6 +57,43 @@ def test_idempotent_order_independent():
     assert r1.json()["reaction_id"] == r2.json()["reaction_id"]
 
 
+def test_idempotent_equivalent_formula_writing():
+    """产物写作 OH2 与 H2O 组成/电荷相同：同一 reaction_id，第二次命中缓存，
+    且命中后仍按本次输入展示化学式与系数。"""
+    r1 = client.post(
+        "/api/v1/balance", json={"reactants": ["H2", "O2"], "products": ["H2O"]}
+    )
+    r2 = client.post(
+        "/api/v1/balance", json={"reactants": ["H2", "O2"], "products": ["OH2"]}
+    )
+    assert r1.status_code == 200 and r2.status_code == 200
+    d1, d2 = r1.json(), r2.json()
+    assert d1["reaction_id"] == d2["reaction_id"]
+    assert d2["cached"] is True
+    assert d1["coefficients"]["vector"] == d2["coefficients"]["vector"] == [2, 1, 2]
+    # 命中缓存后按本次输入回显写法
+    assert d2["normalized"]["products"] == ["OH2"]
+    assert d2["normalized"]["equation"] == "2H2 + O2 -> 2OH2"
+    assert d2["coefficients"]["products"][0]["normalized"] == "OH2"
+    assert d2["coefficients"]["products"][0]["coefficient"] == 2
+
+
+def test_analyze_idempotent_equivalent_formula_writing():
+    """/analyze 与 /balance 共享签名：OH2 等价写法命中同一记录。"""
+    r1 = client.post(
+        "/api/v1/analyze", json={"reactants": ["H2", "O2"], "products": ["H2O"]}
+    )
+    r2 = client.post(
+        "/api/v1/analyze", json={"reactants": ["H2", "O2"], "products": ["OH2"]}
+    )
+    assert r1.status_code == 200 and r2.status_code == 200
+    d1, d2 = r1.json(), r2.json()
+    assert d1["reaction_id"] == d2["reaction_id"]
+    assert d2["cached"] is True
+    assert d2["normalized"]["products"] == ["OH2"]
+    assert d2["balanced_ok"] is True
+
+
 def test_get_reaction_by_id():
     created = client.post(
         "/api/v1/balance", json={"reactants": ["Fe", "O2"], "products": ["Fe2O3"]}

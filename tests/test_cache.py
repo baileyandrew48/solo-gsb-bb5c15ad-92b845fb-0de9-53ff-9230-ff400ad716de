@@ -2,9 +2,11 @@
 
 覆盖：读写与 LRU 访问顺序、跨“重启”（重新打开同一数据库文件）恢复、
 成功与错误记录格式、写入/访问/淘汰事务原子性（无法识别的存储版本
-应在启动时明确报错）。
+应在启动时明确报错）、等价写法（H2O 与 OH2）共享签名、旧格式签名
+记录的 GET 兼容。
 """
 
+import json
 import sqlite3
 
 import pytest
@@ -15,6 +17,7 @@ from app.cache import (
     ReactionCache,
     build_signature,
     reaction_id_for,
+    species_key,
 )
 from app.parser import parse_formula
 from app.balancer import Species
@@ -252,5 +255,181 @@ def test_service_balance_record_recovers_after_reopen(tmp_path, monkeypatch):
     assert got_err.status_code == 400
     assert got_err.json()["error"]["code"] == "FORMULA_PARSE_ERROR"
     assert got_err.json()["reaction_id"] == err_rid
+    reopened.close()
+
+
+# ------------------------------------------------------------ 签名：等价写法
+def test_signature_ignores_element_order():
+    """H2O 与 OH2 组成、电荷相同：签名不得混入规范化文本。"""
+    reactants = [_species("H2"), _species("O2")]
+    assert build_signature(reactants, [_species("H2O")]) == build_signature(
+        reactants, [_species("OH2")]
+    )
+
+
+def test_signature_preserves_sides():
+    """同一组物种整体换侧（反应物 <-> 生成物）必须得到不同签名。"""
+    left = [_species("H2"), _species("O2")]
+    right = [_species("H2O")]
+    assert build_signature(left, right) != build_signature(right, left)
+
+
+def test_signature_includes_charge_and_multiplicity():
+    """电荷不同则签名不同；同一物种在同一侧的重数也计入签名。"""
+    assert build_signature([_species("SO4^2-")], []) != build_signature(
+        [_species("SO4")], []
+    )
+    assert build_signature([_species("H2"), _species("H2")], []) != build_signature(
+        [_species("H2")], []
+    )
+
+
+def test_equivalent_writings_share_record():
+    """缓存层：H2O 写入的记录可被 OH2 的签名命中。"""
+    c = ReactionCache(":memory:")
+    reactants = [_species("H2"), _species("O2")]
+    sig = build_signature(reactants, [_species("H2O")])
+    record = c.put(sig, reactants, [_species("H2O")], {"k": 2}, ["H", "O"], None)
+
+    sig_equiv = build_signature(reactants, [_species("OH2")])
+    assert sig_equiv == sig
+    hit = c.get_by_signature(sig_equiv)
+    assert hit is not None
+    assert hit.reaction_id == record.reaction_id
+    assert len(c) == 1
+
+
+# ------------------------------------------------------------ 旧格式签名兼容
+def _legacy_signature(reactants: list[Species], products: list[Species]) -> str:
+    """修复前的签名格式：组成键之外还混入规范化文本（用于模拟旧记录）。"""
+    payload = {
+        "r": sorted((species_key(sp), sp.normalized) for sp in reactants),
+        "p": sorted((species_key(sp), sp.normalized) for sp in products),
+    }
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def test_legacy_signature_record_remains_gettable(tmp_path):
+    """旧代码（签名含规范化文本）写入的记录：旧 reaction_id 重启后仍可 GET。"""
+    db = tmp_path / "legacy.db"
+    reactants = [_species("H2"), _species("O2")]
+    products = [_species("H2O")]
+
+    c1 = ReactionCache(db)
+    legacy_sig = _legacy_signature(reactants, products)
+    legacy_record = c1.put(legacy_sig, reactants, products, {"k": 2}, ["H", "O"], None)
+    legacy_id = legacy_record.reaction_id
+    c1.close()
+
+    c2 = ReactionCache(db)  # 模拟容器重启
+    # 旧 reaction_id 仍可按 ID 取回（GET 不经过签名算法）
+    fetched = c2.get(legacy_id)
+    assert fetched is not None
+    assert fetched.reaction_id == legacy_id
+    assert fetched.signature == legacy_sig
+    assert fetched.coefficients == {"k": 2}
+
+    # 新签名与旧签名不同：同一反应的新写法写入新记录，两条记录共存
+    new_sig = build_signature(reactants, products)
+    assert new_sig != legacy_sig
+    assert c2.get_by_signature(new_sig) is None
+    new_record = c2.put(new_sig, reactants, products, {"k": 2}, ["H", "O"], None)
+    assert new_record.reaction_id != legacy_id
+    assert c2.get(legacy_id) is not None  # 旧记录未被破坏
+    assert len(c2) == 2
+    c2.close()
+
+
+def test_legacy_record_gettable_via_api_after_reopen(tmp_path, monkeypatch):
+    """旧格式签名记录（含真实配平系数）经 GET 接口在重启后仍完整返回。"""
+    from app import service
+    from app.balancer import solve_reaction
+    from app.service import _coef_map
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    db = tmp_path / "legacy_api.db"
+    # 模拟旧版本 service 写入：旧格式签名 + 规范系数映射
+    solved = solve_reaction(["Na", "H2O"], ["NaOH", "H2"])
+    legacy_sig = _legacy_signature(list(solved.reactants), list(solved.products))
+    writer = ReactionCache(db)
+    legacy_record = writer.put(
+        legacy_sig,
+        list(solved.reactants),
+        list(solved.products),
+        _coef_map(solved),
+        list(solved.elements),
+        None,
+    )
+    legacy_id = legacy_record.reaction_id
+    writer.close()
+
+    # 模拟容器重启：新代码打开同一数据库
+    reopened = ReactionCache(db)
+    monkeypatch.setattr(service, "cache", reopened)
+    client = TestClient(app)
+
+    got = client.get(f"/api/v1/reactions/{legacy_id}")
+    assert got.status_code == 200
+    body = got.json()
+    assert body["reaction_id"] == legacy_id
+    assert body["cached"] is True
+    assert body["coefficients"]["vector"] == [2, 2, 2, 1]
+    assert body["normalized"]["equation"] == "2H2O + 2Na -> 2NaOH + H2"
+
+    # 同一反应以新签名再次 POST：生成新记录，旧记录不受影响
+    posted = client.post(
+        "/api/v1/balance",
+        json={"reactants": ["Na", "H2O"], "products": ["NaOH", "H2"]},
+    )
+    assert posted.status_code == 200
+    assert posted.json()["reaction_id"] != legacy_id
+    assert client.get(f"/api/v1/reactions/{legacy_id}").status_code == 200
+    reopened.close()
+
+
+# ------------------------------------------------------------ 端到端：等价写法 + 重启
+def test_equivalent_writing_hits_cache_after_reopen(tmp_path, monkeypatch):
+    """新签名记录重启后仍命中；等价写法（OH2）与原始写法共享同一记录。"""
+    from app import service
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    db = tmp_path / "equiv.db"
+    persistent = ReactionCache(db)
+    monkeypatch.setattr(service, "cache", persistent)
+
+    client = TestClient(app)
+    r1 = client.post(
+        "/api/v1/balance", json={"reactants": ["H2", "O2"], "products": ["H2O"]}
+    )
+    assert r1.status_code == 200
+    rid = r1.json()["reaction_id"]
+    persistent.close()
+
+    # 模拟容器重启：同一数据库文件重新打开
+    reopened = ReactionCache(db)
+    monkeypatch.setattr(service, "cache", reopened)
+
+    # 等价写法（产物写作 OH2）：同一 reaction_id，命中缓存
+    r2 = client.post(
+        "/api/v1/balance", json={"reactants": ["H2", "O2"], "products": ["OH2"]}
+    )
+    assert r2.status_code == 200
+    body = r2.json()
+    assert body["reaction_id"] == rid
+    assert body["cached"] is True
+    assert body["coefficients"]["vector"] == [2, 1, 2]
+    # 命中后仍按本次输入展示化学式与系数
+    assert body["normalized"]["products"] == ["OH2"]
+    assert body["normalized"]["equation"] == "2H2 + O2 -> 2OH2"
+    assert body["coefficients"]["products"][0]["input"] == "OH2"
+    assert body["coefficients"]["products"][0]["normalized"] == "OH2"
+    assert body["coefficients"]["products"][0]["coefficient"] == 2
+
+    # GET 仍可取回同一记录
+    got = client.get(f"/api/v1/reactions/{rid}")
+    assert got.status_code == 200
+    assert got.json()["reaction_id"] == rid
     reopened.close()
 

@@ -1,13 +1,21 @@
 """基于规范化签名的幂等缓存（SQLite 持久化，LRU 淘汰）。
 
-缓存键与具体写法无关：只依赖每一侧“物种组成键 + 电荷”的多重集，
-因此 ``SO4^2-`` 与 ``[SO4]2-``、不同括号风格、不同的物种书写顺序
-都会命中同一条记录。条目数量有上限（默认 10000 条），按最近访问
-（读或写）时间 LRU 淘汰。
+缓存键与具体写法无关：只依赖每一侧“物种组成键（元素组成 + 电荷）”的
+多重集与重数，并保留反应物 / 生成物的侧别，因此 ``SO4^2-`` 与
+``[SO4]2-``、不同括号风格、不同的物种书写顺序、以及同一化学式内元素
+书写顺序不同（``H2O`` 与 ``OH2``）都会命中同一条记录。条目数量有上限
+（默认 10000 条），按最近访问（读或写）时间 LRU 淘汰。
 
 与早期纯内存实现不同，记录持久化在 SQLite 文件中，容器重启后仍可
 取回。路径由环境变量 ``REACTION_CACHE_DB`` 指定（默认内存库 ``:memory:``，
 便于测试）；未设置或为 ``:memory:`` 时不跨进程保留。
+
+签名格式历史：早期版本在签名中混入了物种的规范化文本，导致 ``H2O`` 与
+``OH2`` 这类组成相同但规范化文本不同的写法生成不同的 reaction_id。
+当前版本的签名只含组成键（见 :func:`build_signature`）；旧版本写入的
+记录仍原样保留在库中，其旧 reaction_id 可继续通过
+:meth:`ReactionCache.get`（即 ``GET /api/v1/reactions/{reaction_id}``）
+取回——按 ID 读取不经过签名算法，新旧记录互不影响。
 
 并发与完整性：
 
@@ -70,9 +78,16 @@ def species_key(sp: Species) -> str:
 
 
 def build_signature(reactants: list[Species], products: list[Species]) -> str:
+    """生成反应的幂等签名。
+
+    签名只由每一侧物种组成键（元素组成 + 电荷，见 :func:`species_key`）
+    的多重集构成：不混入规范化文本，因此 ``H2O`` 与 ``OH2`` 等仅元素
+    书写顺序不同的等价写法得到同一签名；同一物种在同一侧出现多次时
+    按重数计入；``r`` / ``p`` 分开保留反应物与生成物的侧别。
+    """
     payload = {
-        "r": sorted((species_key(sp), sp.normalized) for sp in reactants),
-        "p": sorted((species_key(sp), sp.normalized) for sp in products),
+        "r": sorted(species_key(sp) for sp in reactants),
+        "p": sorted(species_key(sp) for sp in products),
     }
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
